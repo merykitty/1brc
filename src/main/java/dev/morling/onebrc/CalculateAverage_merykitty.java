@@ -19,13 +19,15 @@ import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
 import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
 import java.nio.channels.FileChannel.MapMode;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
-import java.util.Arrays;
+import java.util.Map;
 import java.util.TreeMap;
 import jdk.incubator.vector.ByteVector;
 import jdk.incubator.vector.VectorOperators;
@@ -33,7 +35,9 @@ import jdk.incubator.vector.VectorSpecies;
 
 public class CalculateAverage_merykitty {
     private static final String FILE = "./measurements.txt";
-    private static final VectorSpecies<Byte> BYTE_SPECIES = ByteVector.SPECIES_PREFERRED;
+    private static final VectorSpecies<Byte> BYTE_SPECIES = ByteVector.SPECIES_PREFERRED.length() >= 32
+            ? ByteVector.SPECIES_256
+            : ByteVector.SPECIES_128;
     private static final ValueLayout.OfLong JAVA_LONG_LT = ValueLayout.JAVA_LONG_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
     private static final long KEY_MAX_SIZE = 100;
 
@@ -54,70 +58,119 @@ public class CalculateAverage_merykitty {
 
     // An open-address map that is specialized for this task
     private static class PoorManMap {
-        static final int R_LOAD_FACTOR = 2;
+        private static final int R_LOAD_FACTOR = 2;
 
-        private static class PoorManMapNode {
-            byte[] data;
-            int size;
-            int hash;
-            Aggregator aggr;
+        // 100-byte key + 4-byte hash + 4-byte size +
+        // 2-byte min + 2-byte max + 8-byte sum + 8-byte count
+        private static final int ENTRY_SIZE = 128;
+        private static final int SIZE_OFFSET = 0;
+        private static final int HASH_OFFSET = 4;
+        private static final int SUM_OFFSET = 8;
+        private static final int COUNT_OFFSET = 16;
+        private static final int MIN_OFFSET = 24;
+        private static final int MAX_OFFSET = 26;
+        private static final int KEY_OFFSET = 28;
+        private static final int DEFAULT_CAPACITY = 1 << 13;
 
-            PoorManMapNode(MemorySegment data, long offset, int size, int hash) {
-                this.hash = hash;
-                this.size = size;
-                this.data = new byte[Math.max(size, BYTE_SPECIES.vectorByteSize())];
-                this.aggr = new Aggregator();
-                MemorySegment.copy(data, offset, MemorySegment.ofArray(this.data), 0, size);
-            }
-        }
+        private static final VarHandle LONG_ACCESSOR = MethodHandles.byteArrayViewVarHandle(long[].class, ByteOrder.nativeOrder()).withInvokeExactBehavior();
+        private static final VarHandle INT_ACCESSOR = MethodHandles.byteArrayViewVarHandle(int[].class, ByteOrder.nativeOrder()).withInvokeExactBehavior();
+        private static final VarHandle SHORT_ACCESSOR = MethodHandles.byteArrayViewVarHandle(short[].class, ByteOrder.nativeOrder()).withInvokeExactBehavior();
 
-        MemorySegment data;
-        PoorManMapNode[] nodes;
+        byte[] data;
+
         int size;
+        int capacity;
 
-        PoorManMap(MemorySegment data) {
-            this.data = data;
-            this.nodes = new PoorManMapNode[1 << 10];
+        PoorManMap() {
+            this.capacity = DEFAULT_CAPACITY;
+            this.data = new byte[DEFAULT_CAPACITY * ENTRY_SIZE];
         }
 
-        Aggregator indexSimple(long offset, int size, int hash) {
+        int size(int idx) {
+            return (int) INT_ACCESSOR.get(this.data, idx * ENTRY_SIZE + SIZE_OFFSET);
+        }
+
+        int keyOffset(int idx) {
+            return idx * ENTRY_SIZE + KEY_OFFSET;
+        }
+
+        void observe(int idx, long value) {
+            int offset = idx * ENTRY_SIZE;
+            SHORT_ACCESSOR.set(this.data, offset + MIN_OFFSET,
+                    (short) Math.min(value, (short) SHORT_ACCESSOR.get(this.data, offset + MIN_OFFSET)));
+            SHORT_ACCESSOR.set(this.data, offset + MAX_OFFSET,
+                    (short) Math.max(value, (short) SHORT_ACCESSOR.get(this.data, offset + MAX_OFFSET)));
+            LONG_ACCESSOR.set(this.data, offset + SUM_OFFSET,
+                    value + (long) LONG_ACCESSOR.get(this.data, offset + SUM_OFFSET));
+            LONG_ACCESSOR.set(this.data, offset + COUNT_OFFSET,
+                    1 + (long) LONG_ACCESSOR.get(this.data, offset + COUNT_OFFSET));
+        }
+
+        int indexSimple(MemorySegment data, long offset, int size) {
+            int hash;
+            if (size >= Integer.BYTES) {
+                hash = data.get(ValueLayout.JAVA_INT_UNALIGNED, offset)
+                        + data.get(ValueLayout.JAVA_INT_UNALIGNED, offset + size - Integer.BYTES);
+            }
+            else {
+                hash = data.get(ValueLayout.JAVA_BYTE, offset);
+            }
             hash = rehash(hash);
-            int bucketMask = nodes.length - 1;
+            int bucketMask = this.capacity - 1;
             int bucket = hash & bucketMask;
             for (;; bucket = (bucket + 1) & bucketMask) {
-                PoorManMapNode node = nodes[bucket];
-                if (node == null) {
-                    this.size++;
-                    if (this.size * R_LOAD_FACTOR > nodes.length) {
-                        grow();
-                        bucketMask = nodes.length - 1;
-                        for (bucket = hash & bucketMask; nodes[bucket] != null; bucket = (bucket + 1) & bucketMask) {
-                        }
-                    }
-                    node = new PoorManMapNode(this.data, offset, size, hash);
-                    nodes[bucket] = node;
-                    return node.aggr;
+                int nodeSize = size(bucket);
+                if (nodeSize == 0) {
+                    return insertInto(bucket, data, offset, size, hash);
                 }
-                else if (keyEqualScalar(node, offset, size, hash)) {
-                    return node.aggr;
+                else if (keyEqualScalar(bucket, data, offset, size)) {
+                    return bucket;
                 }
             }
         }
 
-        void grow() {
-            var oldNodes = this.nodes;
-            var newNodes = new PoorManMapNode[oldNodes.length * 2];
-            int bucketMask = newNodes.length - 1;
-            for (var node : oldNodes) {
-                if (node == null) {
+        int insertInto(int bucket, MemorySegment data, long offset, int size, int hash) {
+            this.size++;
+            if (this.size * R_LOAD_FACTOR > this.capacity) {
+                grow();
+                int bucketMask = this.capacity - 1;
+                for (bucket = hash & bucketMask; size(bucket) != 0; bucket = (bucket + 1) & bucketMask) {
+                }
+            }
+            int entryOffset = bucket * ENTRY_SIZE;
+            INT_ACCESSOR.set(this.data, entryOffset + SIZE_OFFSET, size);
+            INT_ACCESSOR.set(this.data, entryOffset + HASH_OFFSET, hash);
+            SHORT_ACCESSOR.set(this.data, entryOffset + MIN_OFFSET, Short.MAX_VALUE);
+            SHORT_ACCESSOR.set(this.data, entryOffset + MAX_OFFSET, Short.MIN_VALUE);
+            MemorySegment.copy(data, offset, MemorySegment.ofArray(this.data), entryOffset + KEY_OFFSET, size);
+            return bucket;
+        }
+
+        void mergeInto(Map<String, Aggregator> target) {
+            for (int i = 0; i < this.capacity; i++) {
+                int size = size(i);
+                if (size == 0) {
                     continue;
                 }
-                int bucket = node.hash & bucketMask;
-                for (; newNodes[bucket] != null; bucket = (bucket + 1) & bucketMask) {
-                }
-                newNodes[bucket] = node;
+
+                int entryOffset = i * ENTRY_SIZE;
+                long min = (short) SHORT_ACCESSOR.get(this.data, entryOffset + MIN_OFFSET);
+                long max = (short) SHORT_ACCESSOR.get(this.data, entryOffset + MAX_OFFSET);
+                long sum = (long) LONG_ACCESSOR.get(this.data, entryOffset + SUM_OFFSET);
+                long count = (long) LONG_ACCESSOR.get(this.data, entryOffset + COUNT_OFFSET);
+                String key = new String(this.data, entryOffset + KEY_OFFSET, size, StandardCharsets.UTF_8);
+                target.compute(key, (k, v) -> {
+                    if (v == null) {
+                        v = new Aggregator();
+                    }
+
+                    v.min = Math.min(v.min, min);
+                    v.max = Math.max(v.max, max);
+                    v.sum += sum;
+                    v.count += count;
+                    return v;
+                });
             }
-            this.nodes = newNodes;
         }
 
         static int rehash(int x) {
@@ -127,14 +180,39 @@ public class CalculateAverage_merykitty {
             return x;
         }
 
-        private boolean keyEqualScalar(PoorManMapNode node, long offset, long size, int hash) {
-            if (node.hash != hash || node.size != size) {
+        private void grow() {
+            int oldCapacity = this.capacity;
+            var oldData = this.data;
+            var newCapacity = oldCapacity * 2;
+            var newData = new byte[newCapacity * ENTRY_SIZE];
+            int bucketMask = newCapacity - 1;
+            for (int i = 0; i < oldCapacity; i++) {
+                int oldOffset = i * ENTRY_SIZE;
+                int size = (int) INT_ACCESSOR.get(oldData, oldOffset + SIZE_OFFSET);
+                if (size == 0) {
+                    continue;
+                }
+                int bucket = (int) INT_ACCESSOR.get(oldData, oldOffset + HASH_OFFSET) & bucketMask;
+                while ((int) INT_ACCESSOR.get(newData, bucket * ENTRY_SIZE + SIZE_OFFSET) != 0) {
+                    bucket = (bucket + 1) & bucketMask;
+                }
+                for (int j = 0; j < KEY_OFFSET + size; j++) {
+                    newData[bucket * ENTRY_SIZE + j] = oldData[oldOffset + j];
+                }
+            }
+            this.data = newData;
+            this.capacity = newCapacity;
+        }
+
+        private boolean keyEqualScalar(int bucket, MemorySegment data, long offset, int size) {
+            if (size(bucket) != size) {
                 return false;
             }
 
             // Be simple
+            int entryOffset = bucket * ENTRY_SIZE;
             for (int i = 0; i < size; i++) {
-                int c1 = node.data[i];
+                int c1 = this.data[entryOffset + KEY_OFFSET + i];
                 int c2 = data.get(ValueLayout.JAVA_BYTE, offset + i);
                 if (c1 != c2) {
                     return false;
@@ -148,7 +226,7 @@ public class CalculateAverage_merykitty {
     // 1 - 2 digits to the left and 1 digits to the right of the separator to a
     // fix-precision format. It returns the offset of the next line (presumably followed
     // the final digit and a '\n')
-    private static long parseDataPoint(Aggregator aggr, MemorySegment data, long offset) {
+    private static long parseDataPoint(PoorManMap aggrMap, int bucket, MemorySegment data, long offset) {
         long word = data.get(JAVA_LONG_LT, offset);
         // The 4th binary digit of the ascii of a digit is 1 while
         // that of the '.' is 0. This finds the decimal separator
@@ -172,16 +250,13 @@ public class CalculateAverage_merykitty {
         // That was close :)
         long absValue = ((digits * 0x640a0001) >>> 32) & 0x3FF;
         long value = (absValue ^ signed) - signed;
-        aggr.min = Math.min(value, aggr.min);
-        aggr.max = Math.max(value, aggr.max);
-        aggr.sum += value;
-        aggr.count++;
+        aggrMap.observe(bucket, value);
         return offset + (decimalSepPos >>> 3) + 3;
     }
 
     // Tail processing version of the above, do not over-fetch and be simple
-    private static long parseDataPointTail(Aggregator aggr, MemorySegment data, long offset) {
-        int point = 0;
+    private static long parseDataPointSimple(PoorManMap aggrMap, int bucket, MemorySegment data, long offset) {
+        int value = 0;
         boolean negative = false;
         if (data.get(ValueLayout.JAVA_BYTE, offset) == '-') {
             negative = true;
@@ -191,18 +266,15 @@ public class CalculateAverage_merykitty {
             int c = data.get(ValueLayout.JAVA_BYTE, offset);
             if (c == '.') {
                 c = data.get(ValueLayout.JAVA_BYTE, offset + 1);
-                point = point * 10 + (c - '0');
+                value = value * 10 + (c - '0');
                 offset += 3;
                 break;
             }
 
-            point = point * 10 + (c - '0');
+            value = value * 10 + (c - '0');
         }
-        point = negative ? -point : point;
-        aggr.min = Math.min(point, aggr.min);
-        aggr.max = Math.max(point, aggr.max);
-        aggr.sum += point;
-        aggr.count++;
+        value = negative ? -value : value;
+        aggrMap.observe(bucket, value);
         return offset;
     }
 
@@ -221,56 +293,45 @@ public class CalculateAverage_merykitty {
         if (keySize == BYTE_SPECIES.vectorByteSize()) {
             for (; data.get(ValueLayout.JAVA_BYTE, offset + keySize) != ';'; keySize++) {
             }
-            int hash = line.reinterpretAsInts().lane(0);
-            var aggr = aggrMap.indexSimple(offset, keySize, hash);
-            return parseDataPoint(aggr, data, offset + 1 + keySize);
-        }
-
-        int hash = data.get(ValueLayout.JAVA_INT_UNALIGNED, offset);
-        if (keySize < Integer.BYTES) {
-            hash = (byte) hash;
+            int bucket = aggrMap.indexSimple(data, offset, keySize);
+            return parseDataPoint(aggrMap, bucket, data, offset + 1 + keySize);
         }
 
         // We inline the searching of the value in the hash map
-        Aggregator aggr;
+        int hash;
+        if (keySize >= Integer.BYTES) {
+            hash = data.get(ValueLayout.JAVA_INT_UNALIGNED, offset) +
+                    data.get(ValueLayout.JAVA_INT_UNALIGNED, offset + keySize - Integer.BYTES);
+        }
+        else {
+            hash = data.get(ValueLayout.JAVA_BYTE, offset);
+        }
         hash = PoorManMap.rehash(hash);
-        int bucketMask = aggrMap.nodes.length - 1;
+        int bucketMask = aggrMap.capacity - 1;
         int bucket = hash & bucketMask;
         for (;; bucket = (bucket + 1) & bucketMask) {
-            PoorManMap.PoorManMapNode node = aggrMap.nodes[bucket];
-            if (node == null) {
-                aggrMap.size++;
-                if (aggrMap.size * PoorManMap.R_LOAD_FACTOR > aggrMap.nodes.length) {
-                    aggrMap.grow();
-                    bucketMask = aggrMap.nodes.length - 1;
-                    for (bucket = hash & bucketMask; aggrMap.nodes[bucket] != null; bucket = (bucket + 1) & bucketMask) {
-                    }
-                }
-                node = new PoorManMap.PoorManMapNode(data, offset, keySize, hash);
-                aggrMap.nodes[bucket] = node;
-                aggr = node.aggr;
-                break;
+            if (aggrMap.size(bucket) == 0) {
+                aggrMap.insertInto(bucket, data, offset, keySize, hash);
             }
 
-            if (node.hash != hash || node.size != keySize) {
+            if (aggrMap.size(bucket) != keySize) {
                 continue;
             }
 
-            var nodeKey = ByteVector.fromArray(BYTE_SPECIES, node.data, 0);
+            var nodeKey = ByteVector.fromArray(BYTE_SPECIES, aggrMap.data, aggrMap.keyOffset(bucket));
             long eqMask = line.compare(VectorOperators.EQ, nodeKey).toLong();
             long validMask = -1L >>> -keySize;
             if ((eqMask & validMask) == validMask) {
-                aggr = node.aggr;
                 break;
             }
         }
 
-        return parseDataPoint(aggr, data, offset + 1 + keySize);
+        return parseDataPoint(aggrMap, bucket, data, offset + keySize + 1);
     }
 
     // Process all lines that start in [offset, limit)
     private static PoorManMap processFile(MemorySegment data, long offset, long limit) {
-        var aggrMap = new PoorManMap(data);
+        var aggrMap = new PoorManMap();
         // Find the start of a new line
         if (offset != 0) {
             offset--;
@@ -297,15 +358,8 @@ public class CalculateAverage_merykitty {
             int keySize = 0;
             for (; data.get(ValueLayout.JAVA_BYTE, offset + keySize) != ';'; keySize++) {
             }
-            int hash;
-            if (keySize >= Integer.BYTES) {
-                hash = data.get(ValueLayout.JAVA_INT_UNALIGNED, offset);
-            }
-            else {
-                hash = data.get(ValueLayout.JAVA_BYTE, offset);
-            }
-            var aggr = aggrMap.indexSimple(offset, keySize, hash);
-            offset = parseDataPointTail(aggr, data, offset + 1 + keySize);
+            int bucket = aggrMap.indexSimple(data, offset, keySize);
+            offset = parseDataPointSimple(aggrMap, bucket, data, offset + 1 + keySize);
         }
 
         return aggrMap;
@@ -334,23 +388,7 @@ public class CalculateAverage_merykitty {
 
             // Collect the results
             for (var aggrMap : resultList) {
-                for (var node : aggrMap.nodes) {
-                    if (node == null) {
-                        continue;
-                    }
-                    byte[] keyData = Arrays.copyOfRange(node.data, 0, node.size);
-                    String key = new String(keyData, StandardCharsets.UTF_8);
-                    var aggr = node.aggr;
-                    var resAggr = new Aggregator();
-                    var existingAggr = res.putIfAbsent(key, resAggr);
-                    if (existingAggr != null) {
-                        resAggr = existingAggr;
-                    }
-                    resAggr.min = Math.min(resAggr.min, aggr.min);
-                    resAggr.max = Math.max(resAggr.max, aggr.max);
-                    resAggr.sum += aggr.sum;
-                    resAggr.count += aggr.count;
-                }
+                aggrMap.mergeInto(res);
             }
         }
 
