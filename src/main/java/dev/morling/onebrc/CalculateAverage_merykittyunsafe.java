@@ -15,15 +15,10 @@
  */
 package dev.morling.onebrc;
 
-import jdk.incubator.vector.ByteVector;
-import jdk.incubator.vector.VectorOperators;
-import jdk.incubator.vector.VectorSpecies;
-import sun.misc.Unsafe;
-
 import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
-import java.lang.reflect.Field;
+import java.lang.foreign.ValueLayout;
 import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
 import java.nio.channels.FileChannel.MapMode;
@@ -32,20 +27,13 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.Map;
 import java.util.TreeMap;
+import jdk.incubator.vector.ByteVector;
+import jdk.incubator.vector.VectorOperators;
+import jdk.incubator.vector.VectorSpecies;
 
 public class CalculateAverage_merykittyunsafe {
     private static final String FILE = "./measurements.txt";
-    private static final Unsafe UNSAFE;
-    static {
-        try {
-            Field theUnsafe = Unsafe.class.getDeclaredField("theUnsafe");
-            theUnsafe.setAccessible(true);
-            UNSAFE = (Unsafe) theUnsafe.get(Unsafe.class);
-        }
-        catch (NoSuchFieldException | IllegalAccessException e) {
-            throw new RuntimeException(e);
-        }
-    }
+    private static final MemorySegment UNIVERSE = MemorySegment.NULL.reinterpret(Long.MAX_VALUE);
 
     private static final VectorSpecies<Byte> BYTE_SPECIES = ByteVector.SPECIES_PREFERRED.length() >= 32
             ? ByteVector.SPECIES_256
@@ -83,39 +71,39 @@ public class CalculateAverage_merykittyunsafe {
         private static final int CAPACITY = 1 << 17;
         private static final int ENTRY_MASK = ENTRY_SIZE * CAPACITY - 1;
 
-        final byte[] data;
+        final long data;
 
         PoorManMap() {
-            this.data = new byte[CAPACITY * ENTRY_SIZE];
+            this.data = Arena.global().allocate(ENTRY_SIZE * CAPACITY, ENTRY_SIZE).address();
         }
 
         void observe(long entryOffset, long value) {
-            long baseOffset = Unsafe.ARRAY_BYTE_BASE_OFFSET + entryOffset;
-            UNSAFE.putShort(this.data, baseOffset + MIN_OFFSET,
-                    (short) Math.min(value, UNSAFE.getShort(this.data, baseOffset + MIN_OFFSET)));
-            UNSAFE.putShort(this.data, baseOffset + MAX_OFFSET,
-                    (short) Math.max(value, UNSAFE.getShort(this.data, baseOffset + MAX_OFFSET)));
-            UNSAFE.putLong(this.data, baseOffset + SUM_OFFSET,
-                    value + UNSAFE.getLong(this.data, baseOffset + SUM_OFFSET));
-            UNSAFE.putLong(this.data, baseOffset + COUNT_OFFSET,
-                    1 + UNSAFE.getLong(this.data, baseOffset + COUNT_OFFSET));
+            long baseOffset = this.data + entryOffset;
+            UNIVERSE.set(ValueLayout.JAVA_SHORT_UNALIGNED, baseOffset + MIN_OFFSET,
+                    (short) Math.min(value, UNIVERSE.get(ValueLayout.JAVA_SHORT_UNALIGNED, baseOffset + MIN_OFFSET)));
+            UNIVERSE.set(ValueLayout.JAVA_SHORT_UNALIGNED, baseOffset + MAX_OFFSET,
+                    (short) Math.max(value, UNIVERSE.get(ValueLayout.JAVA_SHORT_UNALIGNED, baseOffset + MAX_OFFSET)));
+            UNIVERSE.set(ValueLayout.JAVA_LONG_UNALIGNED, baseOffset + SUM_OFFSET,
+                    value + UNIVERSE.get(ValueLayout.JAVA_LONG_UNALIGNED, baseOffset + SUM_OFFSET));
+            UNIVERSE.set(ValueLayout.JAVA_LONG_UNALIGNED, baseOffset + COUNT_OFFSET,
+                    1 + UNIVERSE.get(ValueLayout.JAVA_LONG_UNALIGNED, baseOffset + COUNT_OFFSET));
         }
 
         long indexSimple(long address, int size) {
             int x;
             int y;
             if (size >= Integer.BYTES) {
-                x = UNSAFE.getInt(address);
-                y = UNSAFE.getInt(address + size - Integer.BYTES);
+                x = UNIVERSE.get(ValueLayout.JAVA_INT_UNALIGNED, address);
+                y = UNIVERSE.get(ValueLayout.JAVA_INT_UNALIGNED, address + size - Integer.BYTES);
             }
             else {
-                x = UNSAFE.getByte(address);
-                y = UNSAFE.getByte(address + size - Byte.BYTES);
+                x = UNIVERSE.get(ValueLayout.JAVA_BYTE, address);
+                y = UNIVERSE.get(ValueLayout.JAVA_BYTE, address + size - Byte.BYTES);
             }
             int hash = hash(x, y);
             long entryOffset = (hash * ENTRY_SIZE) & ENTRY_MASK;
             for (;; entryOffset = (entryOffset + ENTRY_SIZE) & ENTRY_MASK) {
-                int nodeSize = UNSAFE.getInt(this.data, Unsafe.ARRAY_BYTE_BASE_OFFSET + entryOffset + SIZE_OFFSET);
+                int nodeSize = UNIVERSE.get(ValueLayout.JAVA_INT_UNALIGNED, this.data + entryOffset + SIZE_OFFSET);
                 if (nodeSize == 0) {
                     insertInto(entryOffset, address, size);
                     return entryOffset;
@@ -127,35 +115,32 @@ public class CalculateAverage_merykittyunsafe {
         }
 
         void insertInto(long entryOffset, long address, int size) {
-            long baseOffset = Unsafe.ARRAY_BYTE_BASE_OFFSET + entryOffset;
-            UNSAFE.putInt(this.data, baseOffset + SIZE_OFFSET, size);
-            UNSAFE.putShort(this.data, baseOffset + MIN_OFFSET, Short.MAX_VALUE);
-            UNSAFE.putShort(this.data, baseOffset + MAX_OFFSET, Short.MIN_VALUE);
-            try (var arena = Arena.ofConfined()) {
-                var segment = MemorySegment.ofAddress(address)
-                        .reinterpret(size + 1, arena, null);
-                MemorySegment.copy(segment, 0, MemorySegment.ofArray(this.data), entryOffset + KEY_OFFSET, size + 1);
-            }
+            long baseOffset = this.data + entryOffset;
+            UNIVERSE.set(ValueLayout.JAVA_INT_UNALIGNED, baseOffset + SIZE_OFFSET, size);
+            UNIVERSE.set(ValueLayout.JAVA_LONG_UNALIGNED, baseOffset + MIN_OFFSET, Short.MAX_VALUE);
+            UNIVERSE.set(ValueLayout.JAVA_SHORT_UNALIGNED, baseOffset + MAX_OFFSET, Short.MIN_VALUE);
+            MemorySegment.copy(UNIVERSE, address, UNIVERSE, baseOffset + KEY_OFFSET, size + 1);
         }
 
         void mergeInto(Map<String, Aggregator> target) {
-            for (int entryOffset = 0; entryOffset < data.length; entryOffset += ENTRY_SIZE) {
-                long baseOffset = Unsafe.ARRAY_BYTE_BASE_OFFSET + entryOffset;
-                int size = UNSAFE.getInt(this.data, baseOffset + SIZE_OFFSET);
+            for (int entryOffset = 0; entryOffset < CAPACITY * ENTRY_SIZE; entryOffset += ENTRY_SIZE) {
+                long baseOffset = this.data + entryOffset;
+                int size = UNIVERSE.get(ValueLayout.JAVA_INT_UNALIGNED, baseOffset + SIZE_OFFSET);
                 if (size == 0) {
                     continue;
                 }
 
-                String key = new String(this.data, entryOffset + KEY_OFFSET, size, StandardCharsets.UTF_8);
+                var data = UNIVERSE.asSlice(baseOffset + KEY_OFFSET, size).toArray(ValueLayout.JAVA_BYTE);
+                String key = new String(data, StandardCharsets.UTF_8);
                 target.compute(key, (k, v) -> {
                     if (v == null) {
                         v = new Aggregator();
                     }
 
-                    v.min = Math.min(v.min, UNSAFE.getShort(this.data, baseOffset + MIN_OFFSET));
-                    v.max = Math.max(v.max, UNSAFE.getShort(this.data, baseOffset + MAX_OFFSET));
-                    v.sum += UNSAFE.getLong(this.data, baseOffset + SUM_OFFSET);
-                    v.count += UNSAFE.getLong(this.data, baseOffset + COUNT_OFFSET);
+                    v.min = Math.min(v.min, UNIVERSE.get(ValueLayout.JAVA_SHORT_UNALIGNED, baseOffset + MIN_OFFSET));
+                    v.max = Math.max(v.max, UNIVERSE.get(ValueLayout.JAVA_SHORT_UNALIGNED, baseOffset + MAX_OFFSET));
+                    v.sum += UNIVERSE.get(ValueLayout.JAVA_LONG_UNALIGNED, baseOffset + SUM_OFFSET);
+                    v.count += UNIVERSE.get(ValueLayout.JAVA_LONG_UNALIGNED, baseOffset + COUNT_OFFSET);
                     return v;
                 });
             }
@@ -168,15 +153,15 @@ public class CalculateAverage_merykittyunsafe {
         }
 
         private boolean keyEqualScalar(long entryOffset, long address, int size) {
-            long baseOffset = Unsafe.ARRAY_BYTE_BASE_OFFSET + entryOffset;
-            if (UNSAFE.getInt(this.data, baseOffset + SIZE_OFFSET) != size) {
+            long baseOffset = this.data + entryOffset;
+            if (UNIVERSE.get(ValueLayout.JAVA_INT_UNALIGNED, baseOffset + SIZE_OFFSET) != size) {
                 return false;
             }
 
             // Be simple
             for (long i = 0; i < size; i++) {
-                int c1 = UNSAFE.getByte(this.data, baseOffset + KEY_OFFSET + i);
-                int c2 = UNSAFE.getByte(address + i);
+                int c1 = UNIVERSE.get(ValueLayout.JAVA_BYTE, baseOffset + KEY_OFFSET + i);
+                int c2 = UNIVERSE.get(ValueLayout.JAVA_BYTE, address + i);
                 if (c1 != c2) {
                     return false;
                 }
@@ -190,7 +175,7 @@ public class CalculateAverage_merykittyunsafe {
     // fix-precision format. It returns the offset of the next line (presumably followed
     // the final digit and a '\n')
     private static long parseDataPoint(PoorManMap aggrMap, long entryOffset, long address) {
-        long word = UNSAFE.getLong(address);
+        long word = UNIVERSE.get(ValueLayout.JAVA_LONG_UNALIGNED, address);
         if (ByteOrder.nativeOrder() == ByteOrder.BIG_ENDIAN) {
             word = Long.reverseBytes(word);
         }
@@ -224,14 +209,14 @@ public class CalculateAverage_merykittyunsafe {
     private static long parseDataPointSimple(PoorManMap aggrMap, long entryOffset, long address) {
         int value = 0;
         boolean negative = false;
-        if (UNSAFE.getByte(address) == '-') {
+        if (UNIVERSE.get(ValueLayout.JAVA_BYTE, address) == '-') {
             negative = true;
             address++;
         }
         for (;; address++) {
-            int c = UNSAFE.getByte(address);
+            int c = UNIVERSE.get(ValueLayout.JAVA_BYTE, address);
             if (c == '.') {
-                c = UNSAFE.getByte(address + 1);
+                c = UNIVERSE.get(ValueLayout.JAVA_BYTE, address + 1);
                 value = value * 10 + (c - '0');
                 address += 3;
                 break;
@@ -249,12 +234,7 @@ public class CalculateAverage_merykittyunsafe {
     // that we have relative freedom in processing
     // It returns the offset of the next line that it needs processing
     private static long iterate(PoorManMap aggrMap, long address) {
-        ByteVector line;
-        try (var arena = Arena.ofConfined()) {
-            var segment = MemorySegment.ofAddress(address)
-                    .reinterpret(BYTE_SPECIES.vectorByteSize(), arena, null);
-            line = ByteVector.fromMemorySegment(BYTE_SPECIES, segment, 0, ByteOrder.nativeOrder());
-        }
+        ByteVector line = ByteVector.fromMemorySegment(BYTE_SPECIES, UNIVERSE, address, ByteOrder.nativeOrder());
 
         // Find the delimiter ';'
         long semicolons = line.compare(VectorOperators.EQ, ';').toLong();
@@ -263,7 +243,7 @@ public class CalculateAverage_merykittyunsafe {
         // longer than the vector, fall back to scalar processing
         if (semicolons == 0) {
             int keySize = BYTE_SPECIES.length();
-            while (UNSAFE.getByte(address + keySize) != ';') {
+            while (UNIVERSE.get(ValueLayout.JAVA_BYTE, address + keySize) != ';') {
                 keySize++;
             }
             var node = aggrMap.indexSimple(address, keySize);
@@ -275,18 +255,18 @@ public class CalculateAverage_merykittyunsafe {
         int x;
         int y;
         if (keySize >= Integer.BYTES) {
-            x = UNSAFE.getInt(address);
-            y = UNSAFE.getInt(address + keySize - Integer.BYTES);
+            x = UNIVERSE.get(ValueLayout.JAVA_INT_UNALIGNED, address);
+            y = UNIVERSE.get(ValueLayout.JAVA_INT_UNALIGNED, address + keySize - Integer.BYTES);
         }
         else {
-            x = UNSAFE.getByte(address);
-            y = UNSAFE.getByte(address + keySize - Byte.BYTES);
+            x = UNIVERSE.get(ValueLayout.JAVA_BYTE, address);
+            y = UNIVERSE.get(ValueLayout.JAVA_BYTE, address + keySize - Byte.BYTES);
         }
         int hash = PoorManMap.hash(x, y);
         long entryOffset = (hash * PoorManMap.ENTRY_SIZE) & PoorManMap.ENTRY_MASK;
         for (;; entryOffset = (entryOffset + PoorManMap.ENTRY_SIZE) & PoorManMap.ENTRY_MASK) {
-            var nodeSize = UNSAFE.getInt(aggrMap.data, Unsafe.ARRAY_BYTE_BASE_OFFSET
-                    + entryOffset + PoorManMap.SIZE_OFFSET);
+            long baseOffset = entryOffset + aggrMap.data;
+            var nodeSize = UNIVERSE.get(ValueLayout.JAVA_INT_UNALIGNED, baseOffset + PoorManMap.SIZE_OFFSET);
             if (nodeSize == 0) {
                 aggrMap.insertInto(entryOffset, address, keySize);
                 break;
@@ -296,7 +276,7 @@ public class CalculateAverage_merykittyunsafe {
                 continue;
             }
 
-            var nodeKey = ByteVector.fromArray(BYTE_SPECIES, aggrMap.data, (int) (entryOffset + PoorManMap.KEY_OFFSET));
+            var nodeKey = ByteVector.fromMemorySegment(BYTE_SPECIES, UNIVERSE, baseOffset + PoorManMap.KEY_OFFSET, ByteOrder.nativeOrder());
             long eqMask = line.compare(VectorOperators.EQ, nodeKey).toLong();
             long validMask = semicolons ^ (semicolons - 1);
             if ((eqMask & validMask) == validMask) {
@@ -317,7 +297,7 @@ public class CalculateAverage_merykittyunsafe {
         if (offset != 0) {
             begin--;
             while (begin < end) {
-                if (UNSAFE.getByte(begin++) == '\n') {
+                if (UNIVERSE.get(ValueLayout.JAVA_BYTE, begin++) == '\n') {
                     break;
                 }
             }
@@ -337,7 +317,7 @@ public class CalculateAverage_merykittyunsafe {
         // Now we are at the tail, just be simple
         while (begin < end) {
             int keySize = 0;
-            while (UNSAFE.getByte(begin + keySize) != ';') {
+            while (UNIVERSE.get(ValueLayout.JAVA_BYTE, begin + keySize) != ';') {
                 keySize++;
             }
             long entryOffset = aggrMap.indexSimple(begin, keySize);
